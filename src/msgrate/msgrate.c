@@ -618,6 +618,11 @@ main(int argc, char *argv[])
             printf("nbytes:     %d\n", nbytes);
             printf("cache size: %d\n", cache_size * (int)sizeof(int));
             printf("ppn:        %d\n", ppn);
+#if defined(ENABLE_CUDA)
+            printf("CUDA\n");
+#elif defined(ENABLE_HIP)
+            printf("HIP\n");
+#endif
         } else {
             printf("%d %d %d %d %d %d %d ", 
                    world_size, npeers, niters, nmsgs, nbytes,
