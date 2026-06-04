@@ -26,6 +26,133 @@
 #include <string.h>
 #include <unistd.h>
 
+/**
+ * If we're using a GPU aware varient.
+ */
+#ifdef ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+#ifdef ENABLE_HIP
+#include <hip/hip_runtime.h>
+#endif
+
+/**
+ * GPU Aware Helper Functions 
+ */
+static void* bench_alloc(size_t size);
+static void  bench_free(void* ptr);
+static void  bench_memset(void* ptr, int value, size_t size);
+static int   bench_gpu_init(void);
+static void  bench_cleanup(void);
+
+#ifdef ENABLE_CUDA
+static void check_cuda(cudaError_t rc, const char* msg)
+{
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "%s failed: %s\n", msg, cudaGetErrorString(rc));
+        exit(1);
+    }
+}
+#endif
+
+#ifdef ENABLE_HIP
+static void check_hip(hipError_t rc, const char* msg)
+{
+    if (rc != hipSuccess) {
+        fprintf(stderr, "%s failed: %s\n", msg, hipGetErrorString(rc));
+        exit(1);
+    }
+}
+#endif
+
+static int bench_gpu_init(void)
+{
+#if defined(ENABLE_CUDA)
+    int dev = 0;
+    int dev_count = 0;
+    char* s = getenv("LOCAL_RANK");
+
+    check_cuda(cudaGetDeviceCount(&dev_count), "cudaGetDeviceCount");
+    if (dev_count <= 0) {
+        fprintf(stderr, "No CUDA devices found\n");
+        return -1;
+    }
+
+    if (s != NULL) {
+        dev = atoi(s) % dev_count;
+    }
+
+    check_cuda(cudaSetDevice(dev), "cudaSetDevice");
+    return 0;
+
+#elif defined(ENABLE_HIP)
+    int dev = 0;
+    int dev_count = 0;
+    char* s = getenv("LOCAL_RANK");
+
+    check_hip(hipGetDeviceCount(&dev_count), "hipGetDeviceCount");
+    if (dev_count <= 0) {
+        fprintf(stderr, "No HIP devices found\n");
+        return -1;
+    }
+
+    if (s != NULL) {
+        dev = atoi(s) % dev_count;
+    }
+
+    check_hip(hipSetDevice(dev), "hipSetDevice");
+    return 0;
+
+#else
+    return 0;
+#endif
+}
+
+static void* bench_alloc(size_t size)
+{
+    void* p = NULL;
+
+#if defined(ENABLE_CUDA)
+    check_cuda(cudaMalloc(&p, size), "cudaMalloc");
+    check_cuda(cudaMemset(p, 0, size), "cudaMemset");
+#elif defined(ENABLE_HIP)
+    check_hip(hipMalloc(&p, size), "hipMalloc");
+    check_hip(hipMemset(p, 0, size), "hipMemset");
+#else
+    p = malloc(size);
+    if (p == NULL) {
+        perror("malloc");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    memset(p, 0, size);
+#endif
+
+    return p;
+}
+
+static void bench_free(void* ptr)
+{
+    if (ptr == NULL) return;
+
+#if defined(ENABLE_CUDA)
+    check_cuda(cudaFree(ptr), "cudaFree");
+#elif defined(ENABLE_HIP)
+    check_hip(hipFree(ptr), "hipFree");
+#else
+    free(ptr);
+#endif
+}
+
+static void bench_cleanup(void)
+{
+#if defined(ENABLE_CUDA)
+    cudaDeviceSynchronize();
+#elif defined(ENABLE_HIP)
+    hipDeviceSynchronize();
+#endif
+}
+
 /* constants */
 const int magic_tag = 1;
 
@@ -303,6 +430,13 @@ main(int argc, char *argv[])
     int start_err = 0;
     int i;
 
+
+    #if defined(ENABLE_CUDA) || defined(ENABLE_HIP)
+    if (bench_gpu_init() != 0) {
+        exit(1);
+    }
+    #endif
+
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -398,10 +532,9 @@ main(int argc, char *argv[])
     if (NULL == recv_peers) abort_app("malloc");
     cache_buf = malloc(sizeof(int) * cache_size);
     if (NULL == cache_buf) abort_app("malloc");
-    send_buf = malloc(buffer_size);
-    if (NULL == send_buf) abort_app("malloc");
-    recv_buf = malloc(buffer_size);
-    if (NULL == recv_buf) abort_app("malloc");
+    /* Call the functions so we can determine where to allocate.*/
+    send_buf = (char*) bench_alloc(buffer_size);
+    recv_buf = (char*) bench_alloc(buffer_size);
     reqs = malloc(sizeof(MPI_Request) * 2 * nmsgs * npeers);
     if (NULL == reqs) abort_app("malloc");
 
@@ -445,8 +578,58 @@ main(int argc, char *argv[])
     test_allstart();
 
     if (rank == 0 && machine_output) printf("\n");
+    
+    // Clean-up
+    free(send_peers);
+    free(recv_peers);
+    free(cache_buf);
+    free(reqs);
+    bench_free(send_buf);
+    bench_free(recv_buf);
+    bench_cleanup();
 
     /* done */
     MPI_Finalize();
     return 0;
+# -*- Makefile -*-
+#
+# Copyright 2006 Sandia Corporation. Under the terms of Contract
+# DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government
+# retains certain rights in this software.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, 
+# Boston, MA  02110-1301, USA.
+
+RELEASE_VERSION = 1.0
+
+CC = mpicc
+CPPFLAGS = -DVERSION=$(RELEASE_VERSION)
+CFLAGS = -O3
+
+msgrate: msgrate.o
+
+clean:
+        rm -f msgrate.o msgrate *~
+
+dist:
+        rm -rf msgrate-$(RELEASE_VERSION)
+        mkdir msgrate-$(RELEASE_VERSION)
+        (for file in msgrate.c README Makefile GPL.txt LICENSE.txt ; do \
+        cp $$file msgrate-$(RELEASE_VERSION)/. ; \
+        chmod 644 msgrate-$(RELEASE_VERSION)/$$file ; \
+        done)
+        tar czf msgrate-$(RELEASE_VERSION).tar.gz msgrate-$(RELEASE_VERSION)
+        rm -rf msgrate-$(RELEASE_VERSION)
 }
