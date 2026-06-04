@@ -3,7 +3,7 @@ CFLAGS ?= -O3
 LDFLAGS ?=
 SHMEM_CC ?= oshcc
 
-all: mpi_overhead msgrate msgrate-kokkos rma_mt_mpi shmem_mt
+all: mpi_overhead msgrate rma_mt_mpi shmem_mt
 
 mpi_overhead: src/mpi_overhead/mpi_overhead.c
 	$(MPICC) $(CFLAGS) -o $@ $< $(LDFLAGS)
