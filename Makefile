@@ -11,9 +11,6 @@ mpi_overhead: src/mpi_overhead/mpi_overhead.c
 msgrate: src/msgrate/msgrate.c
 	$(MPICC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-msgrate-kokkos: src/msgrate-kokkos/msgrate.c
-	$(MPICC) $(CFLAGS) -o $@ $< $(LDFLAGS)
-
 rma_mt_mpi: src/rma_mt_mpi/msgrate.c
 	$(MPICC) $(CFLAGS) -o $@ $< -pthread $(LDFLAGS)
 
