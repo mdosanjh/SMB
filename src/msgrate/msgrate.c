@@ -37,6 +37,13 @@
 #include <hip/hip_runtime.h>
 #endif
 
+static void
+abort_app(const char *msg)
+{
+    perror(msg);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+}
+
 /**
  * GPU Aware Helper Functions 
  */
@@ -45,6 +52,9 @@ static void  bench_free(void* ptr);
 static void  bench_memset(void* ptr, int value, size_t size);
 static int   bench_gpu_init(void);
 static void  bench_cleanup(void);
+static void bench_memcpy_to_host(void* dst, const void* src, size_t size);
+static void bench_memcpy_from_host(void* dst, const void* src, size_t size);
+static void bench_sync(void);
 
 #ifdef ENABLE_CUDA
 static void check_cuda(cudaError_t rc, const char* msg)
@@ -153,6 +163,98 @@ static void bench_cleanup(void)
 #endif
 }
 
+static void bench_sync(void)
+{
+#if defined(ENABLE_CUDA)
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+#elif defined(ENABLE_HIP)
+    check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize");
+#endif
+}
+
+static void bench_memcpy_to_host(void* dst, const void* src, size_t size)
+{
+#if defined(ENABLE_CUDA)
+    check_cuda(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
+#elif defined(ENABLE_HIP)
+    check_hip(hipMemcpy(dst, src, size, hipMemcpyDeviceToHost), "hipMemcpy D2H");
+#else
+    memcpy(dst, src, size);
+#endif
+}
+
+static void bench_memcpy_from_host(void* dst, const void* src, size_t size)
+{
+#if defined(ENABLE_CUDA)
+    check_cuda(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice), "cudaMemcpy H2D");
+#elif defined(ENABLE_HIP)
+    check_hip(hipMemcpy(dst, src, size, hipMemcpyHostToDevice), "hipMemcpy H2D");
+#else
+    memcpy(dst, src, size);
+#endif
+}
+
+/** Verification helper functions */
+static unsigned char pattern_byte(int src_rank, int msg_idx, size_t byte_idx)
+{
+    unsigned int x = (unsigned int) src_rank;
+    x = x * 131u + (unsigned int) msg_idx;
+    x = x * 131u + (unsigned int) byte_idx;
+    return (unsigned char) (x & 0xffu);
+}
+
+static void init_send_buffer(char* buf, int rank, int npeers, int nmsgs, size_t nbytes)
+{
+    size_t total = (size_t) npeers * (size_t) nmsgs * nbytes;
+    unsigned char* host = (unsigned char*) malloc(total);
+    if (host == NULL) abort_app("malloc");
+
+    for (int j = 0; j < npeers; ++j) {
+        for (int k = 0; k < nmsgs; ++k) {
+            size_t base = ((size_t) j * (size_t) nmsgs + (size_t) k) * nbytes;
+            for (size_t b = 0; b < nbytes; ++b) {
+                host[base + b] = pattern_byte(rank, k, b);
+            }
+        }
+    }
+
+    bench_memcpy_from_host(buf, host, total);
+    bench_sync();
+    free(host);
+}
+
+static void verify_recv_buffer(char* buf, int rank, int* recv_peers, int npeers, int nmsgs, size_t nbytes)
+{
+    size_t total = (size_t) npeers * (size_t) nmsgs * nbytes;
+    unsigned char* host = (unsigned char*) malloc(total);
+    if (host == NULL) abort_app("malloc");
+
+    bench_memcpy_to_host(host, buf, total);
+    bench_sync();
+
+    for (int j = 0; j < npeers; ++j) {
+        int src_rank = recv_peers[j];
+        for (int k = 0; k < nmsgs; ++k) {
+            size_t base = ((size_t) j * (size_t) nmsgs + (size_t) k) * nbytes;
+            for (size_t b = 0; b < nbytes; ++b) {
+                unsigned char expected = pattern_byte(src_rank, k, b);
+                if (host[base + b] != expected) {
+                    fprintf(stderr,
+                            "Verification failed on rank %d at recv_slot=%d msg=%d byte=%zu: got=%u expected=%u src=%d\n",
+                            rank, j, k, b,
+                            (unsigned int) host[base + b],
+                            (unsigned int) expected,
+                            src_rank);
+                    free(host);
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+            }
+        }
+    }
+
+    free(host);
+}
+
 /* constants */
 const int magic_tag = 1;
 
@@ -164,7 +266,7 @@ size_t nbytes = 8;
 size_t cache_size = (8 * 1024 * 1024 / sizeof(int));
 int ppn = -1;
 int machine_output = 0;
-
+int verify = 0;
 /* globals */
 int *send_peers;
 int *recv_peers;
@@ -175,14 +277,6 @@ MPI_Request *reqs;
 
 int rank = -1;
 int world_size = -1;
-
-static void
-abort_app(const char *msg)
-{
-    perror(msg);
-    MPI_Abort(MPI_COMM_WORLD, 1);
-}
-
 
 static void
 cache_invalidate(void)
@@ -423,7 +517,8 @@ usage(void)
     fprintf(stderr, "  -c <size>    Cache size in bytes\n");
     fprintf(stderr, "  -n <ppn>     Number of procs per node\n");
     fprintf(stderr, "  -o           Format output to be machine readable\n");
-    fprintf(stderr, "\nReport bugs to <bwbarre@sandia.gov>\n");
+    fprintf(stderr, "  -v           Verify message contents\n");
+    fprintf(stderr, "\nReport bugs to <mdosanj@sandia.gov>\n");
 }
 
 
@@ -448,7 +543,7 @@ main(int argc, char *argv[])
     if (0 == rank) {
         int ch;
         while (start_err != 1 && 
-               (ch = getopt(argc, argv, "p:i:m:s:c:n:oh")) != -1) {
+               (ch = getopt(argc, argv, "p:i:m:s:c:n:ovh")) != -1) {
             switch (ch) {
             case 'p':
                 npeers = atoi(optarg);
@@ -470,6 +565,9 @@ main(int argc, char *argv[])
                 break;
             case 'o':
                 machine_output = 1;
+                break;
+            case 'v':
+                verify = 1;
                 break;
             case 'h':
             case '?':
@@ -510,6 +608,7 @@ main(int argc, char *argv[])
     MPI_Bcast(&nbytes, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&cache_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&ppn, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&verify, 1, MPI_INT, 0, MPI_COMM_WORLD);
     if (0 == rank) {
         if (!machine_output) {
             printf("job size:   %d\n", world_size);
