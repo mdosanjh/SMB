@@ -1,0 +1,11 @@
+#!/bin/bash
+#SBATCH --nodes=9
+#SBATCH --account=FY140001
+
+export MPICH_GPU_SUPPORT_ENABLED=1
+
+PPN=1
+
+for i in {0..24}; do flux run -N9 -n9 ./msgrate -n $PPN -p 8 -c $CACHE -s $((2**i)) -o; done
+
+#flux run -N8 -n8 --exclusive ./msgrate -n 1
